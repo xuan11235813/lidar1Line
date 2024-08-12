@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -45,7 +46,7 @@ func startFileSimulation(fileName string) {
 		}
 
 		byteWorker.chBufferByte <- tmp[:n]
-		//buf = append(buf, tmp[:n]...)
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
@@ -248,6 +249,7 @@ func (w *ByteWorker) ToNum() {
 			}
 		}
 		if len(testBytes) == 1460 {
+
 			N := len(testBytes)
 			if testBytes[N-1] == 0x0a && testBytes[N-2] == 0x0d {
 				var dataFrame []float64
