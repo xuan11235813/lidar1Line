@@ -1,0 +1,12 @@
+previousZ = points(1,3);
+G = zeros(size(points));
+index = 1;
+figure;
+for i=1:numel(points(:,1))
+   if points(i,3) == previousZ
+       G(index,:) = points(i,:);
+       index  = index + 1;
+   else
+       plot3(G())
+   end
+end

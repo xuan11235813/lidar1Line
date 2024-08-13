@@ -277,14 +277,16 @@ type BackLine struct {
 }
 
 type FrameCapture struct {
-	Capture       []Point2D
-	LeftPoint     Point2D
-	RightPoint    Point2D
-	Width         float64
-	Height        float64
-	Length        int32
-	bestFitIndex  int
-	bestFitLength int
+	Capture            []Point2D
+	LeftPoint          Point2D
+	RightPoint         Point2D
+	Width              float64
+	Height             float64
+	Length             int32
+	bestFitIndex       int
+	bestFitLength      int
+	currFrameIndex     int
+	currFrameTimestamp int64
 }
 
 type VehicleCapture struct {
@@ -293,6 +295,9 @@ type VehicleCapture struct {
 	EstimatedWidth  float64
 	isUpdated       bool
 	ObjectNum       int
+	bestLeft        int
+	bestRight       int
+	emptyFrame      int
 }
 
 type EstimateWorker struct {
@@ -301,6 +306,7 @@ type EstimateWorker struct {
 	ChSignalBack    chan BackLine
 	ChVehicles      chan VehicleCapture
 	BackgroundAngle []float64
+	LidarHeight     float64
 	BackLength      int
 
 	BackLineIsReady   bool
@@ -452,6 +458,7 @@ func findDistance2p(p1 Point2D, p2 Point2D) float64 {
 	return math.Sqrt((p1.X-p2.X)*(p1.X-p2.X) + (p1.Y-p2.Y)*(p1.Y-p2.Y))
 }
 
+/*
 func checkIfConnected(f1 FrameCapture, f2 FrameCapture) int {
 	f1L := f1.LeftPoint.index
 	f1R := f1.RightPoint.index
@@ -476,9 +483,35 @@ func checkIfConnected(f1 FrameCapture, f2 FrameCapture) int {
 		}
 	}
 	return sumIndex
+}*/
+
+func checkIfConnectedByHistory(f1 FrameCapture, f2Left int, f2Right int) int {
+	f1L := f1.LeftPoint.index
+	f1R := f1.RightPoint.index
+	f2L := f2Left
+	f2R := f2Right
+	var fMin int = 0.0
+	var fMax int = 0.0
+	if f1L <= f2L {
+		fMin = f1L
+	} else {
+		fMin = f2L
+	}
+	if f1R >= f2R {
+		fMax = f1R
+	} else {
+		fMax = f2R
+	}
+	var sumIndex int = 0
+	for i := fMin; i <= fMax; i++ {
+		if (f1L <= i && i <= f1R) && (f2L <= i && i <= f2R) {
+			sumIndex += 1
+		}
+	}
+	return sumIndex
 }
 
-func fullfillTheFrameCapture(points []Point2D) FrameCapture {
+func fullfillTheFrameCapture(points []Point2D, currFrameNum int) FrameCapture {
 	var frame FrameCapture
 	frame.Capture = points
 	frame.LeftPoint = points[0]
@@ -486,6 +519,8 @@ func fullfillTheFrameCapture(points []Point2D) FrameCapture {
 	frame.Length = int32(points[len(points)-1].index - points[0].index)
 	frame.Height = 0
 	frame.Width = findDistance2p(frame.LeftPoint, frame.RightPoint)
+	frame.bestFitIndex = -1
+	frame.currFrameIndex = currFrameNum
 	for i := 0; i < len(frame.Capture); i++ {
 		if frame.Capture[i].distToLine > frame.Height {
 			frame.Height = frame.Capture[i].distToLine
@@ -493,7 +528,7 @@ func fullfillTheFrameCapture(points []Point2D) FrameCapture {
 	}
 	return frame
 }
-func pointsCuts(points []Point2D) []FrameCapture {
+func pointsCuts(points []Point2D, angleInterval float64, frameNum int) []FrameCapture {
 	var pointsClips []FrameCapture
 	var currentClip []Point2D
 	var lastIndex int32 = -1
@@ -503,11 +538,11 @@ func pointsCuts(points []Point2D) []FrameCapture {
 			currentClip = append(currentClip, points[i])
 			lastIndex = int32(points[i].index)
 		} else {
-			if math.Abs(float64(points[i].index-int(lastIndex))) <= 2.0 {
+			if math.Abs(float64(points[i].index-int(lastIndex))) <= 5.0/math.Abs(angleInterval) {
 				lastIndex = int32(points[i].index)
 				currentClip = append(currentClip, points[i])
 			} else {
-				frame := fullfillTheFrameCapture(currentClip)
+				frame := fullfillTheFrameCapture(currentClip, frameNum)
 				pointsClips = append(pointsClips, frame)
 				currentClip = nil
 				currentClip = append(currentClip, points[i])
@@ -516,7 +551,7 @@ func pointsCuts(points []Point2D) []FrameCapture {
 		}
 	}
 	if len(currentClip) > 1 {
-		frame := fullfillTheFrameCapture(currentClip)
+		frame := fullfillTheFrameCapture(currentClip, frameNum)
 		pointsClips = append(pointsClips, frame)
 	}
 	return pointsClips
@@ -531,14 +566,18 @@ func (w *EstimateWorker) VehicleCuts() {
 	var minimalDistanceThreshold = 0.5
 	var liveVehicles []VehicleCapture
 	var currBackground []float64
+	var currTimestamp int64
 	for i := 0; i < w.BackLength; i++ {
 		currBackground = append(currBackground, 0.0)
 	}
 	var objectNum int = 0
+	var frameNumAccu = 0
 	for {
 		select {
 		case dataFrame := <-w.InputChannel:
 			{
+				currTimestamp = time.Now().UnixMilli()
+				frameNumAccu = frameNumAccu + 1
 				if w.BackLineIsReady && w.BackgroundIsReady {
 					var angleInterval float64 = 0.5
 					if w.BackLength == 720 {
@@ -560,12 +599,14 @@ func (w *EstimateWorker) VehicleCuts() {
 							}
 						}
 					}
-					pointsClips := pointsCuts(pointsCleared)
+					pointsClips := pointsCuts(pointsCleared, angleInterval, frameNumAccu)
 					if len(liveVehicles) == 0 {
 						for _, frameCaptureItem := range pointsClips {
 							var vehicleCaptureItem VehicleCapture
 							vehicleCaptureItem.isUpdated = false
 							vehicleCaptureItem.Captures = append(vehicleCaptureItem.Captures, frameCaptureItem)
+							vehicleCaptureItem.bestLeft = frameCaptureItem.LeftPoint.index
+							vehicleCaptureItem.bestRight = frameCaptureItem.RightPoint.index
 							liveVehicles = append(liveVehicles, vehicleCaptureItem)
 						}
 					} else {
@@ -575,7 +616,7 @@ func (w *EstimateWorker) VehicleCuts() {
 						/* calculate the alignment */
 						for i := 0; i < len(liveVehicles); i++ {
 							for j := 0; j < len(pointsClips); j++ {
-								connectLength := checkIfConnected(liveVehicles[i].Captures[len(liveVehicles[i].Captures)-1], pointsClips[j])
+								connectLength := checkIfConnectedByHistory(liveVehicles[i].Captures[len(liveVehicles[i].Captures)-1], liveVehicles[i].bestLeft, liveVehicles[i].bestRight)
 								if connectLength > 0 {
 									if connectLength > pointsClips[j].bestFitLength {
 										pointsClips[j].bestFitIndex = i
@@ -587,14 +628,50 @@ func (w *EstimateWorker) VehicleCuts() {
 						}
 						/* add the legal points */
 						for i := 0; i < len(pointsClips); i++ {
-							liveVehicles[pointsClips[i].bestFitIndex].isUpdated = true
-							liveVehicles[pointsClips[i].bestFitIndex].Captures = append(liveVehicles[pointsClips[i].bestFitIndex].Captures, pointsClips[i])
+							pointsClips[i].currFrameTimestamp = currTimestamp
+							if pointsClips[i].bestFitIndex >= 0 {
+								if !liveVehicles[pointsClips[i].bestFitIndex].isUpdated {
+									liveVehicles[pointsClips[i].bestFitIndex].emptyFrame = 0
+									liveVehicles[pointsClips[i].bestFitIndex].isUpdated = true
+									liveVehicles[pointsClips[i].bestFitIndex].Captures = append(liveVehicles[pointsClips[i].bestFitIndex].Captures, pointsClips[i])
+									if liveVehicles[pointsClips[i].bestFitIndex].bestLeft > pointsClips[i].LeftPoint.index {
+										liveVehicles[pointsClips[i].bestFitIndex].bestLeft = pointsClips[i].LeftPoint.index
+									}
+									if liveVehicles[pointsClips[i].bestFitIndex].bestRight < pointsClips[i].RightPoint.index {
+										liveVehicles[pointsClips[i].bestFitIndex].bestRight = pointsClips[i].RightPoint.index
+									}
+								} else {
+									liveVehicles[pointsClips[i].bestFitIndex].emptyFrame = 0
+									N := len(liveVehicles[pointsClips[i].bestFitIndex].Captures)
+									liveVehicles[pointsClips[i].bestFitIndex].Captures[N-1].Capture = append(liveVehicles[pointsClips[i].bestFitIndex].Captures[N-1].Capture, pointsClips[i].Capture...)
+									currFrameData := fullfillTheFrameCapture(liveVehicles[pointsClips[i].bestFitIndex].Captures[N-1].Capture, frameNumAccu)
+									currFrameData.currFrameTimestamp = currTimestamp
+									liveVehicles[pointsClips[i].bestFitIndex].Captures[N-1] = currFrameData
+									if liveVehicles[pointsClips[i].bestFitIndex].bestLeft > currFrameData.LeftPoint.index {
+										liveVehicles[pointsClips[i].bestFitIndex].bestLeft = currFrameData.LeftPoint.index
+									}
+									if liveVehicles[pointsClips[i].bestFitIndex].bestRight < currFrameData.RightPoint.index {
+										liveVehicles[pointsClips[i].bestFitIndex].bestRight = currFrameData.RightPoint.index
+									}
+								}
+							} else {
+								var vehicleCaptureItem VehicleCapture
+								vehicleCaptureItem.isUpdated = true
+								vehicleCaptureItem.emptyFrame = 0
+								vehicleCaptureItem.Captures = append(vehicleCaptureItem.Captures, pointsClips[i])
+								vehicleCaptureItem.bestLeft = pointsClips[i].LeftPoint.index
+								vehicleCaptureItem.bestRight = pointsClips[i].RightPoint.index
+								liveVehicles = append(liveVehicles, vehicleCaptureItem)
+							}
 						}
 
 						/* eliminate the finished vehicles */
 						var vehiclesNew []VehicleCapture
 						for _, item := range liveVehicles {
 							if !item.isUpdated {
+								item.emptyFrame = item.emptyFrame + 1
+							}
+							if !item.isUpdated && item.emptyFrame >= 3 {
 								item.ObjectNum = objectNum
 								w.ChVehicles <- item
 								objectNum += 1
@@ -616,6 +693,7 @@ func (w *EstimateWorker) VehicleCuts() {
 				point.X = 0
 				point.Y = 0
 				lidarHeight = findDistance(currentBackLine, point)
+				w.LidarHeight = lidarHeight
 				w.BackLineIsReady = true
 			}
 		case back := <-w.ChBackground:
@@ -628,26 +706,94 @@ func (w *EstimateWorker) VehicleCuts() {
 
 }
 
+type VehicleaNet struct {
+	pointCloud      [][]float64
+	startTimestamp  int64
+	endTimestamp    int64
+	evaluatedHeight float64
+	evaluatedWidth  float64
+	centerX         float64
+}
+
+func (w *EstimateWorker) EvaluateTheVehicle(frameData []FrameCapture) VehicleaNet {
+	var vehicle VehicleaNet
+	N := len(frameData)
+	var currZ float64 = 0.0
+	var heightVec []float64
+	var widthVec []float64
+	var vehicleMinX float64 = 100000
+	var vehicleMaxX float64 = -100000
+	vehicle.startTimestamp = frameData[0].currFrameTimestamp
+	vehicle.endTimestamp = frameData[N-1].currFrameTimestamp
+	for _, item := range frameData {
+		currZ += 0.3
+		var minX float64 = 10000
+		var maxX float64 = -10000
+		for _, capturePoint := range item.Capture {
+			var point []float64
+			point = append(point, capturePoint.X)
+			point = append(point, currZ)
+			point = append(point, w.LidarHeight-capturePoint.Y)
+			vehicle.pointCloud = append(vehicle.pointCloud, point)
+			if point[0] <= minX {
+				minX = point[0]
+			}
+			if point[0] >= maxX {
+				maxX = point[0]
+			}
+			heightVec = append(heightVec, point[2])
+		}
+		if minX < vehicleMinX {
+			vehicleMinX = minX
+		}
+		if maxX > vehicleMaxX {
+			vehicleMaxX = maxX
+		}
+		widthVec = append(widthVec, math.Abs(maxX-minX))
+
+	}
+	sort.Float64s(widthVec)
+	sort.Float64s(heightVec)
+	vehicle.evaluatedWidth = widthVec[len(widthVec)-1]
+	vehicle.evaluatedHeight = heightVec[int(float64(len(heightVec)-1)*0.98)]
+	vehicle.centerX = (vehicleMaxX + vehicleMinX) / 2.0
+	return vehicle
+}
+
+func (w *EstimateWorker) SaveToFile(vehicleItem VehicleCapture) {
+	var currZ float64 = 0.0
+	var stringTable []map[string]string
+	for i := 0; i < len(vehicleItem.Captures); i++ {
+		currZ += 0.3
+		for j := 0; j < len(vehicleItem.Captures[i].Capture); j++ {
+			currX := vehicleItem.Captures[i].Capture[j].X
+			currY := vehicleItem.Captures[i].Capture[j].Y
+
+			currM := map[string]string{}
+			currM["x"] = strconv.FormatFloat(currX, 'f', -1, 64)
+			currM["y"] = strconv.FormatFloat(currZ, 'f', -1, 64)
+			currM["z"] = strconv.FormatFloat(w.LidarHeight-currY, 'f', -1, 64)
+			stringTable = append(stringTable, currM)
+		}
+	}
+	startIndex := strconv.Itoa(vehicleItem.Captures[0].currFrameIndex)
+	endIndex := strconv.Itoa(vehicleItem.Captures[len(vehicleItem.Captures)-1].currFrameIndex)
+	var header = []string{"x", "y", "z"}
+	var fileName string = "./objFile/obj" + strconv.Itoa(vehicleItem.ObjectNum) + "-" + startIndex + "-" + endIndex + "-" + ".csv"
+	MapToCSVFile(stringTable, fileName, header)
+}
+
 func (w *EstimateWorker) VehicleProcess() {
 
 	for vehicleItem := range w.ChVehicles {
-		var currZ float64 = 0.0
-		var stringTable []map[string]string
-		for i := 0; i < len(vehicleItem.Captures); i++ {
-			currZ += 0.1
-			for j := 0; j < len(vehicleItem.Captures[i].Capture); j++ {
-				currX := vehicleItem.Captures[i].Capture[j].X
-				currY := vehicleItem.Captures[i].Capture[j].Y
+		startIndex := strconv.Itoa(vehicleItem.Captures[0].currFrameIndex)
+		endIndex := strconv.Itoa(vehicleItem.Captures[len(vehicleItem.Captures)-1].currFrameIndex)
+		vehicleNet := w.EvaluateTheVehicle(vehicleItem.Captures)
+		w.SaveToFile(vehicleItem)
 
-				currM := map[string]string{}
-				currM["x"] = strconv.FormatFloat(currX, 'f', -1, 64)
-				currM["y"] = strconv.FormatFloat(currY, 'f', -1, 64)
-				currM["z"] = strconv.FormatFloat(currZ, 'f', -1, 64)
-				stringTable = append(stringTable, currM)
-			}
-		}
-		var header = []string{"x", "y", "z"}
-		var fileName string = "obj" + strconv.Itoa(vehicleItem.ObjectNum) + ".csv"
-		MapToCSVFile(stringTable, fileName, header)
+		fmt.Println("==============-" + startIndex + "-" + endIndex + "-=============")
+		fmt.Println("center X := ", vehicleNet.centerX)
+		fmt.Println("width: =", vehicleNet.evaluatedWidth)
+		fmt.Println("height: =", vehicleNet.evaluatedHeight)
 	}
 }
