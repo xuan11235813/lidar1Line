@@ -23,10 +23,10 @@ func main() {
 		startNetLidar()
 	} else {
 		fmt.Println(args[1])
-		startFileSimulation(args[1])
+		startFileSimulation(args[1], args[2])
 	}
 }
-func startFileSimulation(fileName string) {
+func startFileSimulation(fileName string, flag string) {
 	file, err := os.Open(fileName)
 	if err != nil {
 		fmt.Println(err)
@@ -34,7 +34,19 @@ func startFileSimulation(fileName string) {
 	}
 	defer file.Close()
 	byteWorker := StartByteWorker()
-	StarEstimateWorker(byteWorker.chDataFrame, 720)
+	switch flag {
+	case "50":
+		{
+			fmt.Println("50Hz")
+			StarEstimateWorker(byteWorker.chDataFrame, 720)
+		}
+	case "100":
+		{
+			fmt.Println("100Hz")
+			StarEstimateWorker(byteWorker.chDataFrame, 361)
+		}
+	}
+
 	for {
 		tmp := make([]byte, 256)
 		n, err := file.Read(tmp)
@@ -556,6 +568,15 @@ func pointsCuts(points []Point2D, angleInterval float64, frameNum int) []FrameCa
 	}
 	return pointsClips
 }
+
+func IsLegalStart(frame FrameCapture) bool {
+	num := math.Abs(float64(frame.LeftPoint.index - frame.RightPoint.index))
+	if num <= 10 {
+		return false
+	} else {
+		return true
+	}
+}
 func (w *EstimateWorker) VehicleCuts() {
 	var currentBackLine BackLine
 	var lidarHeight = 0.0
@@ -602,12 +623,14 @@ func (w *EstimateWorker) VehicleCuts() {
 					pointsClips := pointsCuts(pointsCleared, angleInterval, frameNumAccu)
 					if len(liveVehicles) == 0 {
 						for _, frameCaptureItem := range pointsClips {
-							var vehicleCaptureItem VehicleCapture
-							vehicleCaptureItem.isUpdated = false
-							vehicleCaptureItem.Captures = append(vehicleCaptureItem.Captures, frameCaptureItem)
-							vehicleCaptureItem.bestLeft = frameCaptureItem.LeftPoint.index
-							vehicleCaptureItem.bestRight = frameCaptureItem.RightPoint.index
-							liveVehicles = append(liveVehicles, vehicleCaptureItem)
+							if IsLegalStart(frameCaptureItem) {
+								var vehicleCaptureItem VehicleCapture
+								vehicleCaptureItem.isUpdated = false
+								vehicleCaptureItem.Captures = append(vehicleCaptureItem.Captures, frameCaptureItem)
+								vehicleCaptureItem.bestLeft = frameCaptureItem.LeftPoint.index
+								vehicleCaptureItem.bestRight = frameCaptureItem.RightPoint.index
+								liveVehicles = append(liveVehicles, vehicleCaptureItem)
+							}
 						}
 					} else {
 						for i := 0; i < len(liveVehicles); i++ {
@@ -616,7 +639,7 @@ func (w *EstimateWorker) VehicleCuts() {
 						/* calculate the alignment */
 						for i := 0; i < len(liveVehicles); i++ {
 							for j := 0; j < len(pointsClips); j++ {
-								connectLength := checkIfConnectedByHistory(liveVehicles[i].Captures[len(liveVehicles[i].Captures)-1], liveVehicles[i].bestLeft, liveVehicles[i].bestRight)
+								connectLength := checkIfConnectedByHistory(liveVehicles[i].Captures[len(liveVehicles[i].Captures)-1], pointsClips[j].LeftPoint.index, pointsClips[j].RightPoint.index)
 								if connectLength > 0 {
 									if connectLength > pointsClips[j].bestFitLength {
 										pointsClips[j].bestFitIndex = i
@@ -656,12 +679,14 @@ func (w *EstimateWorker) VehicleCuts() {
 								}
 							} else {
 								var vehicleCaptureItem VehicleCapture
-								vehicleCaptureItem.isUpdated = true
-								vehicleCaptureItem.emptyFrame = 0
-								vehicleCaptureItem.Captures = append(vehicleCaptureItem.Captures, pointsClips[i])
-								vehicleCaptureItem.bestLeft = pointsClips[i].LeftPoint.index
-								vehicleCaptureItem.bestRight = pointsClips[i].RightPoint.index
-								liveVehicles = append(liveVehicles, vehicleCaptureItem)
+								if IsLegalStart(pointsClips[i]) {
+									vehicleCaptureItem.isUpdated = true
+									vehicleCaptureItem.emptyFrame = 0
+									vehicleCaptureItem.Captures = append(vehicleCaptureItem.Captures, pointsClips[i])
+									vehicleCaptureItem.bestLeft = pointsClips[i].LeftPoint.index
+									vehicleCaptureItem.bestRight = pointsClips[i].RightPoint.index
+									liveVehicles = append(liveVehicles, vehicleCaptureItem)
+								}
 							}
 						}
 
@@ -764,7 +789,7 @@ func (w *EstimateWorker) SaveToFile(vehicleItem VehicleCapture) {
 	var currZ float64 = 0.0
 	var stringTable []map[string]string
 	for i := 0; i < len(vehicleItem.Captures); i++ {
-		currZ += 0.3
+		currZ += 0.2
 		for j := 0; j < len(vehicleItem.Captures[i].Capture); j++ {
 			currX := vehicleItem.Captures[i].Capture[j].X
 			currY := vehicleItem.Captures[i].Capture[j].Y
