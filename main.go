@@ -58,7 +58,7 @@ func startFileSimulation(fileName string, flag string) {
 		}
 
 		byteWorker.chBufferByte <- tmp[:n]
-		time.Sleep(1 * time.Millisecond)
+		time.Sleep(1 * time.Nanosecond)
 	}
 }
 
@@ -497,6 +497,40 @@ func checkIfConnected(f1 FrameCapture, f2 FrameCapture) int {
 	return sumIndex
 }*/
 
+func checkIfConnectedByBest(f1L int, f1R int, f2Left int, f2Right int) int {
+	f2L := f2Left
+	f2R := f2Right
+	var fMin int = 0.0
+	var fMax int = 0.0
+	if f1L <= f2L {
+		fMin = f1L
+	} else {
+		fMin = f2L
+	}
+	if f1R >= f2R {
+		fMax = f1R
+	} else {
+		fMax = f2R
+	}
+	var sumIndex int = 0
+	var totalEmpty int = 0
+	for i := fMin; i <= fMax; i++ {
+		if (f1L <= i && i <= f1R) && (f2L <= i && i <= f2R) {
+			sumIndex += 1
+		}
+		if (f1L > i || i > f1R) && (f2L > i || i > f2R) {
+			totalEmpty += 1
+		}
+	}
+	if sumIndex == 0 {
+		if totalEmpty <= 5 {
+			sumIndex = 1
+		}
+	}
+	return sumIndex
+}
+
+/*
 func checkIfConnectedByHistory(f1 FrameCapture, f2Left int, f2Right int) int {
 	f1L := f1.LeftPoint.index
 	f1R := f1.RightPoint.index
@@ -515,20 +549,43 @@ func checkIfConnectedByHistory(f1 FrameCapture, f2Left int, f2Right int) int {
 		fMax = f2R
 	}
 	var sumIndex int = 0
+	var totalEmpty int = 0
 	for i := fMin; i <= fMax; i++ {
 		if (f1L <= i && i <= f1R) && (f2L <= i && i <= f2R) {
 			sumIndex += 1
 		}
+		if (f1L > i || i > f1R) && (f2L > i || i > f2R) {
+			totalEmpty += 1
+		}
+	}
+	if sumIndex == 0 {
+		if totalEmpty <= 5 {
+			sumIndex = 1
+		}
 	}
 	return sumIndex
 }
+*/
 
 func fullfillTheFrameCapture(points []Point2D, currFrameNum int) FrameCapture {
 	var frame FrameCapture
 	frame.Capture = points
-	frame.LeftPoint = points[0]
-	frame.RightPoint = points[len(points)-1]
-	frame.Length = int32(points[len(points)-1].index - points[0].index)
+	var leftIndex = 100000
+	var rightIndex = 0
+	for i := 0; i < len(points); i++ {
+		if points[i].index < leftIndex {
+			frame.LeftPoint = points[i]
+			leftIndex = points[i].index
+		}
+		if points[i].index > rightIndex {
+			frame.RightPoint = points[i]
+			rightIndex = points[i].index
+		}
+	}
+	//frame.LeftPoint = points[0]
+	//frame.RightPoint = points[len(points)-1]
+	//frame.Length = int32(points[len(points)-1].index - points[0].index)
+	frame.Length = int32(math.Abs(float64(frame.LeftPoint.index) - float64(frame.RightPoint.index)))
 	frame.Height = 0
 	frame.Width = findDistance2p(frame.LeftPoint, frame.RightPoint)
 	frame.bestFitIndex = -1
@@ -639,7 +696,7 @@ func (w *EstimateWorker) VehicleCuts() {
 						/* calculate the alignment */
 						for i := 0; i < len(liveVehicles); i++ {
 							for j := 0; j < len(pointsClips); j++ {
-								connectLength := checkIfConnectedByHistory(liveVehicles[i].Captures[len(liveVehicles[i].Captures)-1], pointsClips[j].LeftPoint.index, pointsClips[j].RightPoint.index)
+								connectLength := checkIfConnectedByBest(liveVehicles[i].bestLeft, liveVehicles[i].bestRight, pointsClips[j].LeftPoint.index, pointsClips[j].RightPoint.index)
 								if connectLength > 0 {
 									if connectLength > pointsClips[j].bestFitLength {
 										pointsClips[j].bestFitIndex = i
@@ -696,7 +753,7 @@ func (w *EstimateWorker) VehicleCuts() {
 							if !item.isUpdated {
 								item.emptyFrame = item.emptyFrame + 1
 							}
-							if !item.isUpdated && item.emptyFrame >= 3 {
+							if !item.isUpdated && item.emptyFrame >= 5 {
 								item.ObjectNum = objectNum
 								w.ChVehicles <- item
 								objectNum += 1
@@ -780,7 +837,7 @@ func (w *EstimateWorker) EvaluateTheVehicle(frameData []FrameCapture) VehicleaNe
 	sort.Float64s(widthVec)
 	sort.Float64s(heightVec)
 	vehicle.evaluatedWidth = widthVec[len(widthVec)-1]
-	vehicle.evaluatedHeight = heightVec[int(float64(len(heightVec)-1)*0.98)]
+	vehicle.evaluatedHeight = heightVec[int(float64(len(heightVec)-1)*0.995)]
 	vehicle.centerX = (vehicleMaxX + vehicleMinX) / 2.0
 	return vehicle
 }
