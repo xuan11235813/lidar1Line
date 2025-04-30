@@ -7,17 +7,18 @@ hold;
 xlim([-4 4])
 ylim([-2,30])
 zlim([0 5])
+k = 2;
 for i=1:numel(points(:,1))
    if points(i,2) == previousZ
        G(index,:) = points(i,:);
        index  = index + 1;
    else
 
-       plot3(G(1:index-1,1), G(1:index-1,2), G(1:index-1,3),"*-")
+       plot3(G(1:index-1,1), G(1:index-1,2)*k, G(1:index-1,3),"*-")
        index = 1;
        G(index,:) = points(i,:);
        previousZ = points(i,2);
        index  = index + 1;
    end
 end
-plot3(G(1:index-1,1), G(1:index-1,2), G(1:index-1,3))
+plot3(G(1:index-1,1), G(1:index-1,2)*k, G(1:index-1,3))

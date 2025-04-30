@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -17,16 +18,61 @@ import (
 	"time"
 )
 
+type ServerEntity struct {
+	Port      string
+	IPAddress string
+}
+
+type ProjectEntity struct {
+	ProjectNum  int
+	ProjectName string
+}
+
+type LaneItem struct {
+	LaneNum      int
+	LaneMinCoord float32
+	LaneMaxCoord float32
+}
+
+type LidarItem struct {
+	Port      string
+	IPAddress string
+	LaneVec   []LaneItem
+}
+
+type Config struct {
+	Server       ServerEntity
+	Project      ProjectEntity
+	LidarTypeVec []LidarItem
+}
+
 func main() {
+
+	var configuration Config
+	data, err := os.ReadFile("./config.json")
+	if err != nil {
+		fmt.Print(err)
+	}
+
+	err = json.Unmarshal(data, &configuration)
+	if err != nil {
+		fmt.Println("error:", err)
+	}
+
 	args := os.Args
 	if len(args) == 1 {
-		startNetLidar()
+		for i := 0; i < 2; i++ {
+			go startNetLidar(configuration.LidarTypeVec[i])
+		}
+		//startNetLidar()
 	} else {
 		fmt.Println(args[1])
-		startFileSimulation(args[1], args[2])
+		startFileSimulation(args[1], args[2], configuration.LidarTypeVec[0])
 	}
+	select {}
 }
-func startFileSimulation(fileName string, flag string) {
+
+func startFileSimulation(fileName string, flag string, lidarProperty LidarItem) {
 	file, err := os.Open(fileName)
 	if err != nil {
 		fmt.Println(err)
@@ -38,12 +84,12 @@ func startFileSimulation(fileName string, flag string) {
 	case "50":
 		{
 			fmt.Println("50Hz")
-			StarEstimateWorker(byteWorker.chDataFrame, 720)
+			StarEstimateWorker(byteWorker.chDataFrame, 720, lidarProperty)
 		}
 	case "100":
 		{
 			fmt.Println("100Hz")
-			StarEstimateWorker(byteWorker.chDataFrame, 361)
+			StarEstimateWorker(byteWorker.chDataFrame, 361, lidarProperty)
 		}
 	}
 
@@ -62,15 +108,16 @@ func startFileSimulation(fileName string, flag string) {
 	}
 }
 
-func startNetLidar() {
-	conn, err := net.Dial("tcp", "192.168.80.6:6008")
+func startNetLidar(lidarProperty LidarItem) {
+	conn, err := net.Dial("tcp", lidarProperty.IPAddress+":"+lidarProperty.Port)
+	//conn, err := net.Dial("tcp", "192.168.80.7:6008")
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
 	defer conn.Close()
 	byteWorker := StartByteWorker()
-	StarEstimateWorker(byteWorker.chDataFrame, 361)
+	StarEstimateWorker(byteWorker.chDataFrame, 361, lidarProperty)
 
 	for {
 		tmp := make([]byte, 256)
@@ -325,7 +372,7 @@ type EstimateWorker struct {
 	BackgroundIsReady bool
 }
 
-func StarEstimateWorker(input chan []float64, backLength int) *EstimateWorker {
+func StarEstimateWorker(input chan []float64, backLength int, lidarProperty LidarItem) *EstimateWorker {
 	w := &EstimateWorker{}
 	w.InputChannel = input
 	w.BackLength = backLength
@@ -340,7 +387,7 @@ func StarEstimateWorker(input chan []float64, backLength int) *EstimateWorker {
 	}
 	go w.calculateTheBackground()
 	go w.VehicleCuts()
-	go w.VehicleProcess()
+	go w.VehicleProcess(lidarProperty)
 	return w
 }
 
@@ -641,6 +688,7 @@ func (w *EstimateWorker) VehicleCuts() {
 	var rightXLimit = 4.0
 	var leftAngleLimit = 40
 	var rightAngleLimit = 320
+	var maximalTrackCaptureNum = 200
 	var minimalDistanceThreshold = 0.5
 	var liveVehicles []VehicleCapture
 	var currBackground []float64
@@ -758,6 +806,9 @@ func (w *EstimateWorker) VehicleCuts() {
 								w.ChVehicles <- item
 								objectNum += 1
 							} else {
+								if len(item.Captures) > maximalTrackCaptureNum {
+									item.Captures = item.Captures[1:]
+								}
 								vehiclesNew = append(vehiclesNew, item)
 							}
 						}
@@ -788,17 +839,37 @@ func (w *EstimateWorker) VehicleCuts() {
 
 }
 
-type VehicleaNet struct {
+type VehicleNet struct {
 	pointCloud      [][]float64
 	startTimestamp  int64
 	endTimestamp    int64
 	evaluatedHeight float64
 	evaluatedWidth  float64
 	centerX         float64
+	laneNum         int32
 }
 
-func (w *EstimateWorker) EvaluateTheVehicle(frameData []FrameCapture) VehicleaNet {
-	var vehicle VehicleaNet
+func (w *EstimateWorker) LaneDetermine(vehicle *VehicleNet, lidarProperty LidarItem) {
+	vehicle.laneNum = -1
+	var minCloseCenterDistance = 1000
+	var minCarWidth = 1.4
+	var closeLaneNum = -1
+	for i := 0; i < len(lidarProperty.LaneVec); i++ {
+		if vehicle.centerX > float64(lidarProperty.LaneVec[i].LaneMinCoord) && vehicle.centerX < float64(lidarProperty.LaneVec[i].LaneMaxCoord) {
+			var currentCloseDistance = math.Abs(vehicle.centerX - float64(lidarProperty.LaneVec[i].LaneMaxCoord)*0.5 - float64(lidarProperty.LaneVec[i].LaneMinCoord)*0.5)
+			if currentCloseDistance < float64(minCloseCenterDistance) {
+				closeLaneNum = lidarProperty.LaneVec[i].LaneNum
+			}
+		}
+	}
+	vehicle.laneNum = int32(closeLaneNum)
+	if vehicle.evaluatedWidth <= minCarWidth {
+		vehicle.laneNum = -1
+	}
+}
+
+func (w *EstimateWorker) EvaluateTheVehicle(frameData []FrameCapture) VehicleNet {
+	var vehicle VehicleNet
 	N := len(frameData)
 	var currZ float64 = 0.0
 	var heightVec []float64
@@ -865,17 +936,20 @@ func (w *EstimateWorker) SaveToFile(vehicleItem VehicleCapture) {
 	MapToCSVFile(stringTable, fileName, header)
 }
 
-func (w *EstimateWorker) VehicleProcess() {
+func (w *EstimateWorker) VehicleProcess(lidarProperty LidarItem) {
 
 	for vehicleItem := range w.ChVehicles {
 		startIndex := strconv.Itoa(vehicleItem.Captures[0].currFrameIndex)
 		endIndex := strconv.Itoa(vehicleItem.Captures[len(vehicleItem.Captures)-1].currFrameIndex)
 		vehicleNet := w.EvaluateTheVehicle(vehicleItem.Captures)
-		w.SaveToFile(vehicleItem)
+		w.LaneDetermine(&vehicleNet, lidarProperty)
+		if vehicleNet.laneNum > 0 {
+			w.SaveToFile(vehicleItem)
 
-		fmt.Println("==============-" + startIndex + "-" + endIndex + "-=============")
-		fmt.Println("center X := ", vehicleNet.centerX)
-		fmt.Println("width: =", vehicleNet.evaluatedWidth)
-		fmt.Println("height: =", vehicleNet.evaluatedHeight)
+			fmt.Println("==============-" + startIndex + "-" + endIndex + "-=============")
+			fmt.Println("center X := ", vehicleNet.centerX, "with lane index", vehicleNet.laneNum)
+			fmt.Println("width: =", vehicleNet.evaluatedWidth)
+			fmt.Println("height: =", vehicleNet.evaluatedHeight)
+		}
 	}
 }
