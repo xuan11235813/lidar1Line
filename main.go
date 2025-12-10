@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"math"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,6 +36,7 @@ type LaneItem struct {
 }
 
 type LidarItem struct {
+	LidarID   string
 	Port      string
 	IPAddress string
 	LaneVec   []LaneItem
@@ -62,7 +64,7 @@ func main() {
 	args := os.Args
 	if len(args) == 1 {
 		for i := 0; i < 2; i++ {
-			go startNetLidar(configuration.LidarTypeVec[i])
+			go startNetLidar(configuration.LidarTypeVec[i], configuration.Server)
 		}
 		//startNetLidar()
 	} else {
@@ -73,6 +75,7 @@ func main() {
 }
 
 func startFileSimulation(fileName string, flag string, lidarProperty LidarItem) {
+	var serverProperty ServerEntity
 	file, err := os.Open(fileName)
 	if err != nil {
 		fmt.Println(err)
@@ -84,12 +87,12 @@ func startFileSimulation(fileName string, flag string, lidarProperty LidarItem) 
 	case "50":
 		{
 			fmt.Println("50Hz")
-			StarEstimateWorker(byteWorker.chDataFrame, 720, lidarProperty)
+			StarEstimateWorker(byteWorker.chDataFrame, 720, lidarProperty, serverProperty, false)
 		}
 	case "100":
 		{
 			fmt.Println("100Hz")
-			StarEstimateWorker(byteWorker.chDataFrame, 361, lidarProperty)
+			StarEstimateWorker(byteWorker.chDataFrame, 361, lidarProperty, serverProperty, false)
 		}
 	}
 
@@ -108,7 +111,7 @@ func startFileSimulation(fileName string, flag string, lidarProperty LidarItem) 
 	}
 }
 
-func startNetLidar(lidarProperty LidarItem) {
+func startNetLidar(lidarProperty LidarItem, serverProperty ServerEntity) {
 	conn, err := net.Dial("tcp", lidarProperty.IPAddress+":"+lidarProperty.Port)
 	//conn, err := net.Dial("tcp", "192.168.80.7:6008")
 	if err != nil {
@@ -117,7 +120,7 @@ func startNetLidar(lidarProperty LidarItem) {
 	}
 	defer conn.Close()
 	byteWorker := StartByteWorker()
-	StarEstimateWorker(byteWorker.chDataFrame, 361, lidarProperty)
+	StarEstimateWorker(byteWorker.chDataFrame, 361, lidarProperty, serverProperty, true)
 
 	for {
 		tmp := make([]byte, 256)
@@ -364,6 +367,7 @@ type EstimateWorker struct {
 	ChBackground    chan []float64
 	ChSignalBack    chan BackLine
 	ChVehicles      chan VehicleCapture
+	ChVehiclesJSON  chan VehicleNetJSON
 	BackgroundAngle []float64
 	LidarHeight     float64
 	BackLength      int
@@ -372,13 +376,14 @@ type EstimateWorker struct {
 	BackgroundIsReady bool
 }
 
-func StarEstimateWorker(input chan []float64, backLength int, lidarProperty LidarItem) *EstimateWorker {
+func StarEstimateWorker(input chan []float64, backLength int, lidarProperty LidarItem, serverProperty ServerEntity, isNetworkFlag bool) *EstimateWorker {
 	w := &EstimateWorker{}
 	w.InputChannel = input
 	w.BackLength = backLength
 	w.ChSignalBack = make(chan BackLine, 1)
 	w.ChBackground = make(chan []float64, 3)
 	w.ChVehicles = make(chan VehicleCapture, 3)
+	w.ChVehiclesJSON = make(chan VehicleNetJSON, 3)
 	w.BackLineIsReady = false
 	w.BackgroundIsReady = false
 
@@ -388,6 +393,9 @@ func StarEstimateWorker(input chan []float64, backLength int, lidarProperty Lida
 	go w.calculateTheBackground()
 	go w.VehicleCuts()
 	go w.VehicleProcess(lidarProperty)
+	if isNetworkFlag {
+		go w.NetworkSending(serverProperty)
+	}
 	return w
 }
 
@@ -849,6 +857,17 @@ type VehicleNet struct {
 	laneNum         int32
 }
 
+// VehicleNetJSON is a JSON-serializable version of VehicleNet without pointCloud.
+type VehicleNetJSON struct {
+	StartTimestamp  int64   `json:"startTimestamp"`
+	EndTimestamp    int64   `json:"endTimestamp"`
+	EvaluatedHeight float64 `json:"evaluatedHeight"`
+	EvaluatedWidth  float64 `json:"evaluatedWidth"`
+	CenterX         float64 `json:"centerX"`
+	LaneNum         int32   `json:"laneNum"`
+	LidarID         string  `json:"lidarID"`
+}
+
 func (w *EstimateWorker) LaneDetermine(vehicle *VehicleNet, lidarProperty LidarItem) {
 	vehicle.laneNum = -1
 	var minCloseCenterDistance = 1000
@@ -950,6 +969,69 @@ func (w *EstimateWorker) VehicleProcess(lidarProperty LidarItem) {
 			fmt.Println("center X := ", vehicleNet.centerX, "with lane index", vehicleNet.laneNum)
 			fmt.Println("width: =", vehicleNet.evaluatedWidth)
 			fmt.Println("height: =", vehicleNet.evaluatedHeight)
+
+			// Create JSON-serializable struct and send to channel
+			vehicleJSON := VehicleNetJSON{
+				StartTimestamp:  vehicleNet.startTimestamp,
+				EndTimestamp:    vehicleNet.endTimestamp,
+				EvaluatedHeight: vehicleNet.evaluatedHeight,
+				EvaluatedWidth:  vehicleNet.evaluatedWidth,
+				CenterX:         vehicleNet.centerX,
+				LaneNum:         vehicleNet.laneNum,
+				LidarID:         lidarProperty.LidarID,
+			}
+			select {
+			case w.ChVehiclesJSON <- vehicleJSON:
+			default:
+				// channel full, drop vehicle JSON to avoid blocking
+				fmt.Printf("Channel full, dropping vehicle JSON (lane %d)\n", vehicleJSON.LaneNum)
+			}
+		}
+	}
+}
+
+func (w *EstimateWorker) NetworkSending(serverProperty ServerEntity) {
+	url := "http://" + serverProperty.IPAddress + ":" + serverProperty.Port + "/vehicles"
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:       10,
+			IdleConnTimeout:    90 * time.Second,
+			DisableCompression: false,
+			DisableKeepAlives:  false,
+		},
+	}
+
+	for vehicle := range w.ChVehiclesJSON {
+		// Marshal vehicle to JSON
+		jsonData, err := json.Marshal(vehicle)
+		if err != nil {
+			fmt.Printf("Failed to marshal vehicle JSON: %v\n", err)
+			continue
+		}
+
+		// Retry loop with connection reestablishment
+		for {
+			req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+			if err != nil {
+				fmt.Printf("Failed to create request: %v\n", err)
+				break // cannot recover
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			resp, err := client.Do(req)
+			if err != nil {
+				fmt.Printf("POST request failed: %v. Reconnecting in 5 seconds...\n", err)
+				time.Sleep(5 * time.Second)
+				// Optionally recreate client if needed
+				continue
+			}
+
+			// Read and print response
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			fmt.Printf("Server response: %s\n", string(body))
+			break // success, move to next vehicle
 		}
 	}
 }

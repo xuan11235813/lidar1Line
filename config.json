@@ -9,6 +9,7 @@
     },
     "LidarTypeVec": [
         {
+            "LidarID": "1",
             "Port": "6008",
             "IpAddress": "192.168.80.6",
             "LaneVec": [
@@ -25,6 +26,7 @@
             ]
         },
         {
+            "LidarID": "2",
             "Port": "6008",
             "IpAddress": "192.168.80.7",
             "LaneVec": [
