@@ -63,7 +63,7 @@ func main() {
 
 	args := os.Args
 	if len(args) == 1 {
-		for i := 0; i < 2; i++ {
+		for i := 0; i < len(configuration.LidarTypeVec); i++ {
 			go startNetLidar(configuration.LidarTypeVec[i], configuration.Server)
 		}
 		//startNetLidar()
@@ -181,70 +181,71 @@ func CSVFileToMap(filePath string) (returnMap []map[string]string, err error) {
 
 // MapToCSVFile  writes slice of map into csv file
 // filterFields filters to only the fields in the slice, and maintains order when writing to file
-func MapToCSVFile(inputSliceMap []map[string]string, filePath string, filterFields []string) (err error) {
+func MapToCSVFile(inputSliceMap []map[string]string, filePath string, filterFields []string, flagInternal bool) (err error) {
+	if flagInternal {
+		var headers []string  // slice of each header field
+		var line []string     // slice of each line field
+		var csvLine string    // string of line converted to csv
+		var CSVContent string // final output of csv containing header and lines
 
-	var headers []string  // slice of each header field
-	var line []string     // slice of each line field
-	var csvLine string    // string of line converted to csv
-	var CSVContent string // final output of csv containing header and lines
-
-	// iter over slice to get all possible keys (csv header) in the maps
-	// using empty Map[string]struct{} to get UNIQUE Keys; no value needed
-	var headerMap = make(map[string]struct{})
-	for _, record := range inputSliceMap {
-		for k := range record {
-			headerMap[k] = struct{}{}
-		}
-	}
-
-	// convert unique headersMap to slice
-	for headerValue := range headerMap {
-		headers = append(headers, headerValue)
-	}
-
-	// filter to filteredFields and maintain order
-	var filteredHeaders []string
-	if len(filterFields) > 0 {
-		for _, filterField := range filterFields {
-			for _, headerValue := range headers {
-				if filterField == headerValue {
-					filteredHeaders = append(filteredHeaders, headerValue)
-				}
+		// iter over slice to get all possible keys (csv header) in the maps
+		// using empty Map[string]struct{} to get UNIQUE Keys; no value needed
+		var headerMap = make(map[string]struct{})
+		for _, record := range inputSliceMap {
+			for k := range record {
+				headerMap[k] = struct{}{}
 			}
 		}
-	} else {
-		filteredHeaders = append(filteredHeaders, headers...)
-		sort.Strings(filteredHeaders) // alpha sort headers
-	}
 
-	// write headers as the first line
-	csvLine, _ = WriteAsCSV(filteredHeaders)
-	CSVContent += csvLine + "\n"
-
-	// iter over inputSliceMap to get values for each map
-	// maintain order provided in header slice
-	// write to csv
-	for _, record := range inputSliceMap {
-		line = []string{}
-
-		// lines
-		for k := range filteredHeaders {
-			line = append(line, record[filteredHeaders[k]])
+		// convert unique headersMap to slice
+		for headerValue := range headerMap {
+			headers = append(headers, headerValue)
 		}
-		csvLine, _ = WriteAsCSV(line)
+
+		// filter to filteredFields and maintain order
+		var filteredHeaders []string
+		if len(filterFields) > 0 {
+			for _, filterField := range filterFields {
+				for _, headerValue := range headers {
+					if filterField == headerValue {
+						filteredHeaders = append(filteredHeaders, headerValue)
+					}
+				}
+			}
+		} else {
+			filteredHeaders = append(filteredHeaders, headers...)
+			sort.Strings(filteredHeaders) // alpha sort headers
+		}
+
+		// write headers as the first line
+		csvLine, _ = WriteAsCSV(filteredHeaders)
 		CSVContent += csvLine + "\n"
-	}
 
-	// make the dir incase it's not there
-	err = os.MkdirAll(filepath.Dir(filePath), os.ModePerm)
-	if err != nil {
-		return err
-	}
+		// iter over inputSliceMap to get values for each map
+		// maintain order provided in header slice
+		// write to csv
+		for _, record := range inputSliceMap {
+			line = []string{}
 
-	// write out the csv contents to file
-	ioutil.WriteFile(filePath, []byte(CSVContent), os.FileMode(0644))
-	if err != nil {
-		return err
+			// lines
+			for k := range filteredHeaders {
+				line = append(line, record[filteredHeaders[k]])
+			}
+			csvLine, _ = WriteAsCSV(line)
+			CSVContent += csvLine + "\n"
+		}
+
+		// make the dir incase it's not there
+		err = os.MkdirAll(filepath.Dir(filePath), os.ModePerm)
+		if err != nil {
+			return err
+		}
+
+		// write out the csv contents to file
+		ioutil.WriteFile(filePath, []byte(CSVContent), os.FileMode(0644))
+		if err != nil {
+			return err
+		}
 	}
 
 	return
@@ -391,7 +392,7 @@ func StarEstimateWorker(input chan []float64, backLength int, lidarProperty Lida
 		w.BackgroundAngle = append(w.BackgroundAngle, 0.0)
 	}
 	go w.calculateTheBackground()
-	go w.VehicleCuts()
+	go w.VehicleCuts(lidarProperty)
 	go w.VehicleProcess(lidarProperty)
 	if isNetworkFlag {
 		go w.NetworkSending(serverProperty)
@@ -689,7 +690,7 @@ func IsLegalStart(frame FrameCapture) bool {
 		return true
 	}
 }
-func (w *EstimateWorker) VehicleCuts() {
+func (w *EstimateWorker) VehicleCuts(lidarProperty LidarItem) {
 	var currentBackLine BackLine
 	var lidarHeight = 0.0
 	var leftXLimit = -4.0
@@ -697,7 +698,7 @@ func (w *EstimateWorker) VehicleCuts() {
 	var leftAngleLimit = 40
 	var rightAngleLimit = 320
 	var maximalTrackCaptureNum = 200
-	var minimalDistanceThreshold = 0.5
+	var minimalDistanceThreshold = 1.0
 	var liveVehicles []VehicleCapture
 	var currBackground []float64
 	var currTimestamp int64
@@ -736,6 +737,7 @@ func (w *EstimateWorker) VehicleCuts() {
 					pointsClips := pointsCuts(pointsCleared, angleInterval, frameNumAccu)
 					if len(liveVehicles) == 0 {
 						for _, frameCaptureItem := range pointsClips {
+							frameCaptureItem.currFrameTimestamp = currTimestamp
 							if IsLegalStart(frameCaptureItem) {
 								var vehicleCaptureItem VehicleCapture
 								vehicleCaptureItem.isUpdated = false
@@ -765,6 +767,9 @@ func (w *EstimateWorker) VehicleCuts() {
 						/* add the legal points */
 						for i := 0; i < len(pointsClips); i++ {
 							pointsClips[i].currFrameTimestamp = currTimestamp
+						}
+						for i := 0; i < len(pointsClips); i++ {
+							pointsClips[i].currFrameTimestamp = currTimestamp
 							if pointsClips[i].bestFitIndex >= 0 {
 								if !liveVehicles[pointsClips[i].bestFitIndex].isUpdated {
 									liveVehicles[pointsClips[i].bestFitIndex].emptyFrame = 0
@@ -783,12 +788,15 @@ func (w *EstimateWorker) VehicleCuts() {
 									currFrameData := fullfillTheFrameCapture(liveVehicles[pointsClips[i].bestFitIndex].Captures[N-1].Capture, frameNumAccu)
 									currFrameData.currFrameTimestamp = currTimestamp
 									liveVehicles[pointsClips[i].bestFitIndex].Captures[N-1] = currFrameData
-									if liveVehicles[pointsClips[i].bestFitIndex].bestLeft > currFrameData.LeftPoint.index {
-										liveVehicles[pointsClips[i].bestFitIndex].bestLeft = currFrameData.LeftPoint.index
-									}
-									if liveVehicles[pointsClips[i].bestFitIndex].bestRight < currFrameData.RightPoint.index {
-										liveVehicles[pointsClips[i].bestFitIndex].bestRight = currFrameData.RightPoint.index
-									}
+									/*
+										if liveVehicles[pointsClips[i].bestFitIndex].bestLeft > currFrameData.LeftPoint.index {
+											liveVehicles[pointsClips[i].bestFitIndex].bestLeft = currFrameData.LeftPoint.index
+										}
+										if liveVehicles[pointsClips[i].bestFitIndex].bestRight < currFrameData.RightPoint.index {
+											liveVehicles[pointsClips[i].bestFitIndex].bestRight = currFrameData.RightPoint.index
+										}*/
+									liveVehicles[pointsClips[i].bestFitIndex].bestLeft = currFrameData.LeftPoint.index
+									liveVehicles[pointsClips[i].bestFitIndex].bestRight = currFrameData.RightPoint.index
 								}
 							} else {
 								var vehicleCaptureItem VehicleCapture
@@ -952,7 +960,7 @@ func (w *EstimateWorker) SaveToFile(vehicleItem VehicleCapture) {
 	endIndex := strconv.Itoa(vehicleItem.Captures[len(vehicleItem.Captures)-1].currFrameIndex)
 	var header = []string{"x", "y", "z"}
 	var fileName string = "./objFile/obj" + strconv.Itoa(vehicleItem.ObjectNum) + "-" + startIndex + "-" + endIndex + "-" + ".csv"
-	MapToCSVFile(stringTable, fileName, header)
+	MapToCSVFile(stringTable, fileName, header, false)
 }
 
 func (w *EstimateWorker) VehicleProcess(lidarProperty LidarItem) {
@@ -980,6 +988,28 @@ func (w *EstimateWorker) VehicleProcess(lidarProperty LidarItem) {
 				LaneNum:         vehicleNet.laneNum,
 				LidarID:         lidarProperty.LidarID,
 			}
+
+			// Save to date-based file (YYYY_MM_DD.csv)
+			currentDate := time.Now().Format("2006_01_02")
+			filename := currentDate + ".csv"
+			file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				fmt.Printf("Failed to open %s: %v\n", filename, err)
+			} else {
+				line := fmt.Sprintf("%d,%d,%.3f,%.3f,%.3f,%d,%s\n",
+					vehicleJSON.StartTimestamp,
+					vehicleJSON.EndTimestamp,
+					vehicleJSON.EvaluatedHeight,
+					vehicleJSON.EvaluatedWidth,
+					vehicleJSON.CenterX,
+					vehicleJSON.LaneNum,
+					vehicleJSON.LidarID)
+				if _, err := file.WriteString(line); err != nil {
+					fmt.Printf("Failed to write to %s: %v\n", filename, err)
+				}
+				file.Close()
+			}
+
 			select {
 			case w.ChVehiclesJSON <- vehicleJSON:
 			default:
