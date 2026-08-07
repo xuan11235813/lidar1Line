@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"math"
 	"net"
 	"net/http"
@@ -17,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 type ServerEntity struct {
@@ -375,6 +378,12 @@ type EstimateWorker struct {
 
 	BackLineIsReady   bool
 	BackgroundIsReady bool
+
+	InputChannelBack   chan []float64
+	InputChannelMain   chan []float64
+	InputChannelDirect chan []float64
+
+	OutputDirectData chan []Point2D
 }
 
 func StarEstimateWorker(input chan []float64, backLength int, lidarProperty LidarItem, serverProperty ServerEntity, isNetworkFlag bool) *EstimateWorker {
@@ -385,15 +394,23 @@ func StarEstimateWorker(input chan []float64, backLength int, lidarProperty Lida
 	w.ChBackground = make(chan []float64, 3)
 	w.ChVehicles = make(chan VehicleCapture, 3)
 	w.ChVehiclesJSON = make(chan VehicleNetJSON, 3)
+	w.InputChannelBack = make(chan []float64, 5)
+	w.InputChannelMain = make(chan []float64, 5)
+	w.InputChannelDirect = make(chan []float64, 5)
+
+	w.OutputDirectData = make(chan []Point2D, 5)
 	w.BackLineIsReady = false
 	w.BackgroundIsReady = false
 
 	for i := 0; i < w.BackLength; i++ {
 		w.BackgroundAngle = append(w.BackgroundAngle, 0.0)
 	}
+	go w.DataDispatch(lidarProperty)
 	go w.calculateTheBackground()
 	go w.VehicleCuts(lidarProperty)
+	go w.RawXYOutput(lidarProperty)
 	go w.VehicleProcess(lidarProperty)
+	go w.StartWebsocketDirect(lidarProperty)
 	if isNetworkFlag {
 		go w.NetworkSending(serverProperty)
 	}
@@ -417,7 +434,7 @@ func (w *EstimateWorker) calculateTheBackground() {
 	var flag int32 = 0
 	var nullChangeTimes int32 = 0
 	var waitingFrameNum = 0
-	for dataFrame := range w.InputChannel {
+	for dataFrame := range w.InputChannelBack {
 		switch flag {
 		case 0:
 			{
@@ -690,6 +707,181 @@ func IsLegalStart(frame FrameCapture) bool {
 		return true
 	}
 }
+func (w *EstimateWorker) DataDispatch(lidarProperty LidarItem) {
+	for dataFrame := range w.InputChannel {
+		select {
+		case w.InputChannelBack <- dataFrame:
+		default:
+		}
+		select {
+		case w.InputChannelMain <- dataFrame:
+		default:
+		}
+		select {
+		case w.InputChannelDirect <- dataFrame:
+		default:
+		}
+	}
+
+}
+
+type FrameMessage struct {
+	Points []PointDTO `json:"points"`
+}
+
+type PointDTO struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+	R float64 `json:"r"`
+}
+
+type Hub struct {
+	clients    map[*websocket.Conn]bool
+	register   chan *websocket.Conn
+	unregister chan *websocket.Conn
+
+	// only latest frame goes here
+	broadcast chan []Point2D
+}
+
+func newHub() *Hub {
+	return &Hub{
+		clients:    make(map[*websocket.Conn]bool),
+		register:   make(chan *websocket.Conn),
+		unregister: make(chan *websocket.Conn),
+
+		// IMPORTANT: size 1 = latest-frame only
+		broadcast: make(chan []Point2D, 1),
+	}
+}
+
+func (h *Hub) run() {
+	for {
+		select {
+
+		case conn := <-h.register:
+			h.clients[conn] = true
+
+		case conn := <-h.unregister:
+			if _, ok := h.clients[conn]; ok {
+				delete(h.clients, conn)
+				conn.Close()
+			}
+
+		case frame := <-h.broadcast:
+
+			msg := FrameMessage{
+				Points: make([]PointDTO, 0, len(frame)),
+			}
+
+			for _, p := range frame {
+				msg.Points = append(msg.Points, PointDTO{
+					X: p.X,
+					Y: p.Y,
+					R: p.R,
+				})
+			}
+
+			data, err := json.Marshal(msg)
+			if err != nil {
+				continue
+			}
+
+			// broadcast to all clients
+			for conn := range h.clients {
+				err := conn.WriteMessage(websocket.TextMessage, data)
+				if err != nil {
+					delete(h.clients, conn)
+					conn.Close()
+				}
+			}
+		}
+	}
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+func (h *Hub) wsHandler(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+
+	h.register <- conn
+
+	go func() {
+		defer func() {
+			h.unregister <- conn
+		}()
+
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				break
+			}
+		}
+	}()
+}
+
+func (h *Hub) startFrameConsumer(in <-chan []Point2D) {
+	for frame := range in {
+
+		// drain old frames, keep only newest
+	drain:
+		for {
+			select {
+			case next := <-in:
+				frame = next
+			default:
+				break drain
+			}
+		}
+
+		// non-blocking send to hub (avoid blocking producer chain)
+		select {
+		case h.broadcast <- frame:
+		default:
+			// drop old queued frame, keep latest
+			<-h.broadcast
+			h.broadcast <- frame
+		}
+	}
+}
+
+func (w *EstimateWorker) RawXYOutput(lidarProperty LidarItem) {
+	var angleInterval float64 = 0.5
+	if w.BackLength == 720 {
+		angleInterval = 0.25
+	}
+	for dataFrame := range w.InputChannelDirect {
+		points := polarToDescartes(dataFrame, -90.0, angleInterval)
+		w.OutputDirectData <- points
+	}
+
+}
+
+func (w *EstimateWorker) StartWebsocketDirect(lidarProperty LidarItem) {
+	hub := newHub()
+	go hub.run()
+	go hub.startFrameConsumer(w.OutputDirectData)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", hub.wsHandler)
+
+	portNum, _ := strconv.Atoi(lidarProperty.Port)
+	idNum, _ := strconv.Atoi(lidarProperty.LidarID)
+	portNum = portNum + idNum
+
+	server := &http.Server{
+		Addr:    ":" + strconv.Itoa(portNum),
+		Handler: mux,
+	}
+	log.Fatal(server.ListenAndServe())
+}
+
 func (w *EstimateWorker) VehicleCuts(lidarProperty LidarItem) {
 	var currentBackLine BackLine
 	var lidarHeight = 0.0
@@ -709,7 +901,7 @@ func (w *EstimateWorker) VehicleCuts(lidarProperty LidarItem) {
 	var frameNumAccu = 0
 	for {
 		select {
-		case dataFrame := <-w.InputChannel:
+		case dataFrame := <-w.InputChannelMain:
 			{
 				currTimestamp = time.Now().UnixMilli()
 				frameNumAccu = frameNumAccu + 1
